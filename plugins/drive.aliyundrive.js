@@ -74,7 +74,7 @@ class Manager {
       let credentials = this.clientMap[data.user_id]
       let { expires_at } = credentials
 
-      if ((expires_at - Date.now()) < 10 * 60 * 1000) {
+      if ((expires_at - Date.now()) < 60 * 1000) {
         let result = await this.refreshAccessToken(credentials)
         if (result.error) {
           return result
@@ -82,10 +82,7 @@ class Manager {
           credentials = this.clientMap[data.user_id]
         }
       }
-
-      credentials.path = data.path ? data.path : '/'
-
-      return { credentials }
+      return { credentials:{...credentials , path: data.path ? data.path : '/'} }
     }
 
     return { unmounted: true }
@@ -147,6 +144,8 @@ class Manager {
           <form class="form-horizontal" method="post">
             <input type="hidden" name="act" value="install" />
             <div class="form-group"><input class="sl-input" type="text" name="refresh_token" value="" placeholder="refresh_token" /></div>
+            <div class="form-group"><input class="sl-input" type="text" name="rootPath" value="" placeholder="初始地址" /></div>
+            <p style="font-size:11px;color:#555;">初始地址 可用于选定初始文件夹。留空时sharelist会匹配默认值。 <br><br>https://www.aliyundrive.com/drive/folder/xxxxxxxxxxx</p>
             <button class="sl-button btn-primary" id="signin" type="submit">确定</button></form>
         </div>
       </div>
@@ -172,7 +171,7 @@ class Manager {
    * @return {object}
    * @api private
    */
-  async create({refresh_token}) {
+  async create({refresh_token , path}) {
     //0 准备工作： 获取必要数据
     let resp
     try{
@@ -193,14 +192,16 @@ class Manager {
     if( !resp || !resp.body || !resp.body.access_token) return { error: true, msg: '无法获取登录token' }
 
     let { user_id , access_token , default_drive_id:drive_id , expires_in } = resp.body
-   
+    
+    refresh_token = resp.body.refresh_token
+    
     let expires_at = Date.now() + expires_in * 1000
 
-    let client = { user_id, access_token, refresh_token, expires_at, drive_id, path:`/` }
+    let client = { user_id, access_token, refresh_token, expires_at, drive_id, path }
 
     this.clientMap[user_id] = client
 
-    await this.updateDrives(this.stringify({ user_id, path: client.path , expires_at , drive_id, access_token , refresh_token }))
+    await this.updateDrives(this.stringify(client))
 
     return { error:false }
   }
@@ -239,7 +240,11 @@ class Manager {
     if( unmounted ){
       let data
       if (req.body && req.body.refresh_token && req.body.act == 'install') {
-        let options = { refresh_token: req.body.refresh_token }
+        let { refresh_token, rootPath } = req.body
+        let options = { refresh_token }
+        rootPath = (rootPath.match(/(?<=\/folder\/)([^\/]+)/) || [''])[0]
+        options.path = rootPath ? `/${rootPath}/` : '/'
+
         let { error, msg } = await this.create(options)
         if (error) {
           data = this.error(msg)
@@ -366,53 +371,67 @@ module.exports = class Driver {
 
     let is_folder = path.endsWith('/')
 
-    let drive_path = path.replace(/(^\/|\/$)/g, '').split('/')
+    let [ parent_file_id , file_id ] = path.replace(/(^\/|\/$)/g, '').split('/')
 
-    let [ parent_file_id , file_id ] = drive_path
     if(!parent_file_id){
       parent_file_id = 'root' 
     }
 
     if (is_folder) {
-      let resp
-      try { 
-        resp = await this.helper.request.post(`https://api.aliyundrive.com/v2/file/list`,{
-            drive_id, 
-            parent_file_id
-          },
-          {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36',
-              'Authorization': access_token,
-            },
-            body:true, 
-            json:true
-          }
-        )
-      }catch(e){ }
-      
-      if (!resp.body) return false
+      let children = [] , marker , ts = Date.now()
 
-      if (!resp.body.items) return manager.error('error', false)
-console.log(resp.body.items)
-      const ts = Date.now()
-      let children = resp.body.items.map((i) => {
-        return {
-          id: manager.stringify({
-            user_id,
-            path: i.type == 'folder' ? `/${i.file_id}/` : `/${parent_file_id}/${i.file_id}`
-          }),
-          name: i.name,
-          ext: i.file_extension,
-          protocol,
-          size: i.size,
-          created_at: i.created_at,
-          updated_at: i.updated_at,
-          type: i.type == 'folder' ? 'folder' : 'file',
-          $download_url:i.download_url,
-          $cached_at: ts
+      do{
+        let resp
+        let params = {
+          drive_id, 
+          parent_file_id,
+          limit:200
         }
-      })
+
+        if( marker ){
+          params.marker = marker
+        }
+
+        try { 
+          resp = await this.helper.request.post(`https://api.aliyundrive.com/v2/file/list`,params,
+            {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36',
+                'Authorization': access_token,
+              },
+              body:true, 
+              json:true
+            }
+          )
+        }catch(e){
+          console.log(e)
+        }
+
+        if (!resp.body) return false
+
+        if (!resp.body.items) return manager.error('error', false)
+
+        for(let i of resp.body.items){
+          children.push({
+            id: manager.stringify({
+              user_id,
+              path: i.type == 'folder' ? `/${i.file_id}/` : `/${parent_file_id}/${i.file_id}`
+            }),
+            name: i.name,
+            ext: i.file_extension,
+            protocol,
+            size: i.size,
+            created_at: i.created_at,
+            updated_at: i.updated_at,
+            type: i.type == 'folder' ? 'folder' : 'file',
+            $download_url:i.download_url,
+            $cached_at: ts
+          })
+        }
+
+        marker = resp.body.next_marker
+
+      }while( marker )
 
       let result = {
         id,
@@ -444,8 +463,9 @@ console.log(resp.body.items)
         protocol: protocol,
         size: hit.size,
         // $expired_at: expired_at,
-        //proxy:true,
+        // proxy:true,
         headers:{
+          'referer': 'https://www.aliyundrive.com/',
           'Referrer-Policy':'no-referrer',
           //'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.104 Safari/537.36'
         }
